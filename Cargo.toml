@@ -1,0 +1,28 @@
+[package]
+name = "rusty"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+alloy-primitives = "0.8.5"
+dotenv = "0.15.0"
+env_logger = "0.11.5"
+ethers = {version = "2", features = ["ws"]}
+indicatif = "0.17.8"
+log = "0.4.22"
+rayon = "1.10.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+uniswap-v2-sdk = "0.4.0"
+uniswap-v3-sdk = "1.1.0"
+
+[profile.performance]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+incremental = false
+
+[[bin]]
+name = "rusty"
+path = "src/main.rs"
