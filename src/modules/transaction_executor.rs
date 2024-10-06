@@ -1,15 +1,8 @@
-use std::sync::Arc;
-
-use super::config::Config;
-
-
-pub struct TransactionExecutor {
-    config: Arc<Config>,
-}
+pub struct TransactionExecutor {}
 
 impl TransactionExecutor {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new() -> Self {
+        Self {  }
     }
 
     pub async fn run(&self) {

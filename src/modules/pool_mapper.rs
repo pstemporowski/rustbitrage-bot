@@ -1,4 +1,4 @@
-use log::{debug, info};
+use log::info;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use ethers::types::{Address, H160};
@@ -36,7 +36,6 @@ pub struct Mapping {
 
 
 impl Mapping {
-
     pub fn new(pools: &Vec<UniV2Pool>) -> Self {
         let mut address_mapping = HashMap::new();
         let mut index_mapping = HashMap::new();

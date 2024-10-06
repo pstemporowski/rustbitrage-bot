@@ -4,7 +4,7 @@ use ethers::providers::{Middleware, StreamExt};
 use ethers::types::{BlockNumber, CallLogFrame, Transaction, U256};
 use log::{debug, warn};
 use tokio::sync::mpsc::error::TrySendError;
-use crate::types::opportunity_tx::OpportunityTx;
+use crate::types::opportunity::Opportunity;
 use crate::utils::tx_logs::get_logs;
 
 use super::config::Config;
@@ -55,13 +55,13 @@ impl BlockchainUpdater {
                     continue;
                 }
 
-                let opportunity = OpportunityTx {
+                let opportunity = Opportunity {
                     tx,
                     logs: significant_logs,
                     time: now,
                 };
 
-                match self.config.opportunity_tx_sender.try_send(opportunity) {
+                match self.config.opportunity_sender.try_send(opportunity) {
                     Ok(_) => (),
                     Err(TrySendError::Full(_)) => continue,
                     Err(TrySendError::Closed(_)) => break,

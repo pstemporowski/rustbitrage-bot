@@ -1,2 +1,2 @@
 pub mod uni_v2_pool;
-pub mod opportunity_tx;
+pub mod opportunity;

@@ -28,7 +28,7 @@ async fn main() {
     let base_fee_updater = BaseFeeUpdater::new(config.clone());
     let updater = BlockchainUpdater::new(config.clone());
     let mut finder = OpportunityFinder::new(config.clone());
-    let executor = TransactionExecutor::new(config.clone());
+    let executor = TransactionExecutor::new();
 
     let base_fee_updater_handle: JoinHandle<()> = tokio::spawn(async move { base_fee_updater.run().await });
     let updater_handle: JoinHandle<()> = tokio::spawn(async move { updater.run().await });
