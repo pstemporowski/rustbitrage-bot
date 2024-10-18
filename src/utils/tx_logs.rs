@@ -1,5 +1,6 @@
 
 use std::sync::Arc;
+use log::debug;
 
 use ethers::{providers::{Middleware, Provider, Ws}, types::{BlockId, BlockNumber, CallConfig, CallFrame, CallLogFrame, GethDebugBuiltInTracerConfig, GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType, GethDebugTracingCallOptions, GethTrace, GethTraceFrame, Transaction},};
 
@@ -37,6 +38,7 @@ use ethers::{providers::{Middleware, Provider, Ws}, types::{BlockId, BlockNumber
             }
         },
         Err(_) => {
+            debug!("Failed to get trace for transaction: {}", tx.hash);
             return None
         }
     }; 

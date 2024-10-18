@@ -1,6 +1,6 @@
 use std::sync::Arc;
-use log::{info, error, debug};
-use ethers::prelude::*;
+use ethers::{providers::{Middleware, StreamExt}, types::{Block, U256, TxHash}};
+use log::{debug, error, info};
 
 use super::config::Config;
 
@@ -14,6 +14,8 @@ impl BaseFeeUpdater {
     }
 
     pub async fn run(&self) {
+        info!("Starting base fee updater");
+
         loop {
             let mut block_stream = match self.config.wss.subscribe_blocks().await {
                 Ok(stream) => stream,
@@ -30,7 +32,7 @@ impl BaseFeeUpdater {
                 debug!("Received new block: {}", block.number.unwrap());
 
                 let base_fee = self.calculate_next_block_base_fee(&block);
-                info!("Current base fee: {}", base_fee);
+                debug!("Current base fee: {}", base_fee);
 
                 let mut lock = self.config.app_state.base_fee.write().await;
                 *lock = base_fee
