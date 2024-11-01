@@ -1,6 +1,6 @@
-pub mod blockchain_updater;
-pub mod opportunity_finder;
-pub mod transaction_executor;
+pub mod blocks_updater;
 pub mod config;
-pub mod base_fee_updater;
-pub mod pool_mapper;
+pub mod mempool_watcher;
+pub mod opportunity_finder;
+pub mod pending_tx_processor;
+pub mod pending_tx_watcher;
