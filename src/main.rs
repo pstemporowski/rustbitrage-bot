@@ -7,10 +7,14 @@ use eyre::Result;
 use futures::future::join_all;
 use log::info;
 use modules::{
-    blocks_updater::BlocksUpdater, config::Config, mempool_watcher::MempoolWatcher,
-    pending_tx_processor::PendingTransactionProcessor,
-    pending_tx_watcher::PendingTransactionWatcher,
+    config::Config,
+    processor::pending_tx_processor::PendingTransactionProcessor,
+    watcher::{
+        blocks_watcher::BlockWatcher, mempool_watcher::MempoolWatcher,
+        pending_tx_watcher::PendingTransactionWatcher,
+    },
 };
+
 use std::sync::Arc;
 use tokio::{sync::mpsc, task::JoinHandle};
 
@@ -32,16 +36,13 @@ async fn main() -> Result<()> {
 
     info!("Initializing Modules...");
     let mem_pool_watcher = MempoolWatcher::new(config.clone());
-    let pools = mem_pool_watcher.run().await?;
-
-    let blocks_updater = BlocksUpdater::new(config.clone());
+    let blocks_updater = BlockWatcher::new(config.clone());
     let tx_watcher = PendingTransactionWatcher::new(config.clone());
-    let pending_tx_processor = PendingTransactionProcessor::new(config.clone(), pools);
-
-    // Get all AutomatedMarketMakers
+    let pending_tx_processor = PendingTransactionProcessor::new(config.clone());
 
     info!("Spawning Tasks...");
     let handles: Vec<JoinHandle<Result<()>>> = vec![
+        tokio::spawn(async move { mem_pool_watcher.run().await }),
         tokio::spawn(async move { blocks_updater.run().await }),
         tokio::spawn(async move { tx_watcher.run(pending_tx_sender).await }),
         tokio::spawn(async move { pending_tx_processor.run(&mut pending_tx_receiver).await }),

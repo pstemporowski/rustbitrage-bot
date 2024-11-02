@@ -10,12 +10,24 @@ use alloy::{
         Transaction,
     },
 };
+use log::{debug, info};
 use std::sync::Arc;
 
+/// Retrieves a call frame for a given transaction by performing debug tracing
+///
+/// # Arguments
+/// * `tx` - The transaction to trace
+/// * `provider` - The RPC provider to use for tracing
+///
+/// # Returns
+/// * `eyre::Result<CallFrame>` - The resulting call frame or error
 pub async fn get_call_frame(
     tx: Transaction,
     provider: Arc<RootProvider<PubSubFrontend>>,
 ) -> eyre::Result<CallFrame> {
+    info!("Getting call frame for transaction: {:?}", tx.hash);
+
+    // Configure tracing options - disable memory, return data, storage and stack for performance
     let trace_options = GethDefaultTracingOptions {
         enable_memory: Some(false),
         enable_return_data: Some(false),
@@ -24,6 +36,7 @@ pub async fn get_call_frame(
         ..Default::default()
     };
 
+    // Set up debug tracing with call tracer and timeout
     let tracing_options = GethDebugTracingOptions {
         tracer: Some(GethDebugTracerType::BuiltInTracer(
             GethDebugBuiltInTracerType::CallTracer,
@@ -33,12 +46,11 @@ pub async fn get_call_frame(
         tracer_config: GethDebugTracerConfig::default(),
     };
 
-    let block_number = tx.block_number.unwrap_or(0);
-
+    // Execute debug trace call using latest block since transaction is pending
     let geth_trace = provider
         .debug_trace_call(
             tx.into(),
-            BlockId::Number(BlockNumberOrTag::Number(block_number)),
+            BlockId::Number(BlockNumberOrTag::Pending),
             GethDebugTracingCallOptions {
                 tracing_options,
                 state_overrides: None,
@@ -47,7 +59,11 @@ pub async fn get_call_frame(
         )
         .await?;
 
+    debug!("Successfully retrieved geth trace");
+
+    // Convert trace result into call frame
     let call_frame = geth_trace.try_into_call_frame()?;
+    info!("Successfully converted trace to call frame");
 
     Ok(call_frame)
 }
