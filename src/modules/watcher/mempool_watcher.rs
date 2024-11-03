@@ -1,13 +1,18 @@
 /// Module for watching mempool and managing AMM state changes
-use std::{path::Path, sync::Arc};
+use std::{path::Path, str::FromStr, sync::Arc};
 
 use alloy::{
-    primitives::{address, Address},
+    primitives::{address, Address, U256},
     providers::RootProvider,
     pubsub::PubSubFrontend,
 };
 use amms::{
-    amm::{factory::Factory, uniswap_v2::factory::UniswapV2Factory, AutomatedMarketMaker, AMM},
+    amm::{
+        factory::Factory,
+        uniswap_v2::{factory::UniswapV2Factory, UniswapV2Pool},
+        AutomatedMarketMaker, AMM,
+    },
+    filters::value::filter_amms_below_usd_threshold,
     state_space::StateSpaceManager,
     sync::{checkpoint::sync_amms_from_checkpoint, sync_amms},
 };
@@ -21,7 +26,10 @@ use tokio::{
     time::Instant,
 };
 
-use crate::modules::config::Config;
+use crate::{
+    modules::config::Config,
+    utils::constants::{MIN_USD_FACTORY_THRESHOLD, USDC, WETH, WETH_USDC_PAIR, WETH_VALUE},
+};
 
 /// Main struct responsible for watching mempool and managing AMM state
 pub struct MempoolWatcher {
@@ -51,12 +59,34 @@ impl MempoolWatcher {
 
         let provider = self.config.provider.clone();
         let pools_map = self.config.app_state.pools_map.clone();
+        let factories = vec![
+            Factory::UniswapV2Factory(UniswapV2Factory::new(
+                address!("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
+                10207858,
+                300,
+            )),
+            Factory::UniswapV2Factory(UniswapV2Factory::new(
+                address!("C0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac"),
+                10794229,
+                300,
+            )),
+        ];
 
         // Synchronize or load AMMs from checkpoint
         debug!("Starting AMM synchronization process");
         let (amms, latest_synced_block) = self
-            .sync_or_load_amms(provider.clone(), checkpoint_path)
+            .sync_or_load_amms(provider.clone(), factories.clone(), checkpoint_path)
             .await?;
+
+        info!("Filtering AMMs below USD threshold");
+        let amms_before_filtering = amms.len();
+        let amms = self
+            .filter_amms(amms, factories, MIN_USD_FACTORY_THRESHOLD, provider.clone())
+            .await?;
+
+        let amms_after_filtering = amms.len();
+        info!("AMMs after filtering: {}", amms_after_filtering);
+        info!("AMMs before filtering: {}", amms_before_filtering);
 
         // Initialize pool map with synchronized AMMs
         debug!("Initializing pool map with {} AMMs", amms.len());
@@ -85,10 +115,12 @@ impl MempoolWatcher {
         info!("MempoolWatcher is now monitoring for state changes");
         while let Some(changed_addresses) = state_change_receiver.recv().await {
             debug!("Processing {} state changes", changed_addresses.len());
+            let now = Instant::now();
             let updated_pools: Vec<AMM> = changed_addresses
-                .into_iter()
+                .into_par_iter()
                 .filter_map(|addr| {
                     if let Some(entry) = pools_map.get(&addr) {
+                        debug!("Pool {:?} has been modified", addr);
                         Some(entry.value().clone())
                     } else {
                         None
@@ -102,6 +134,10 @@ impl MempoolWatcher {
                     updated_pools.len()
                 );
                 self.update_token_graph(&updated_pools).await?;
+                info!(
+                    "Token graph update completed in {} ms",
+                    now.elapsed().as_millis()
+                );
             }
         }
 
@@ -152,18 +188,14 @@ impl MempoolWatcher {
             let index0 = indices_map.get(&token0).unwrap();
             let index1 = indices_map.get(&token1).unwrap();
 
-            let amount_in = 1_000_000_000_000_000_000u128;
-
             // Calculate and add edges for both directions
-            if let Ok(amount_out) = amm.calculate_price(token0, token1) {
-                let rate = amount_out as f64 / amount_in as f64;
+            if let Ok(rate) = amm.calculate_price(token0, token1) {
                 let weight = -rate.ln();
                 let mut graph = graph.lock().await;
                 graph.update_edge(*index0, *index1, weight);
             }
 
-            if let Ok(amount_out) = amm.calculate_price(token1, token0) {
-                let rate = amount_out as f64 / amount_in as f64;
+            if let Ok(rate) = amm.calculate_price(token1, token0) {
                 let weight = -rate.ln();
                 let mut graph = graph.lock().await;
                 graph.update_edge(*index1, *index0, weight);
@@ -288,22 +320,11 @@ impl MempoolWatcher {
     async fn sync_or_load_amms(
         &self,
         provider: Arc<RootProvider<PubSubFrontend>>,
+        factories: Vec<Factory>,
         checkpoint_path: &str,
     ) -> Result<(Vec<AMM>, u64)> {
-        let now = Instant::now();
         // Define factory configurations
-        let factories = vec![
-            Factory::UniswapV2Factory(UniswapV2Factory::new(
-                address!("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-                10207858,
-                300,
-            )),
-            Factory::UniswapV2Factory(UniswapV2Factory::new(
-                address!("C0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac"),
-                10794229,
-                300,
-            )),
-        ];
+
         let path = Path::new(checkpoint_path);
 
         // Either load from checkpoint or sync from chain
@@ -318,12 +339,40 @@ impl MempoolWatcher {
             sync_amms(factories, provider.clone(), Some(checkpoint_path), 1000).await?
         };
 
-        info!(
-            "AMM synchronization completed: {} AMMs in {} ms",
-            amms.len(),
-            now.elapsed().as_millis()
+        Ok((amms, last_synced_block))
+    }
+
+    /// Filter AMMs based on usdt threshold.
+    async fn filter_amms(
+        &self,
+        amms: Vec<AMM>,
+        factories: Vec<Factory>,
+        usdt_threshold: f64,
+        provider: Arc<RootProvider<PubSubFrontend>>,
+    ) -> Result<Vec<AMM>> {
+        let usdc = Address::from_str(USDC).unwrap();
+        let weth_address = Address::from_str(WETH).unwrap();
+        let usd_weth_adrr = Address::from_str(WETH_USDC_PAIR).unwrap();
+        let weth_value = U256::from(WETH_VALUE);
+
+        let usd_weth_pool = AMM::UniswapV2Pool(
+            UniswapV2Pool::new_from_address(usd_weth_adrr, None, 300, provider.clone()).await?,
         );
 
-        Ok((amms, last_synced_block))
+        let amms = filter_amms_below_usd_threshold(
+            amms,
+            &factories,
+            usd_weth_pool,
+            usdt_threshold, //Setting usd_threshold to 15000 filters out any pool that contains less than $15000.00 USD value
+            weth_address,
+            usdc,
+            weth_value,
+            200,
+            provider.clone(),
+        )
+        .await?;
+
+        Ok(amms)
+        // 10 weth
     }
 }

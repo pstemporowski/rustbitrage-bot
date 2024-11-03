@@ -1,11 +1,11 @@
-use alloy::{primitives::FixedBytes, providers::Provider};
+use alloy::providers::Provider;
 use eyre::Result;
 use futures::StreamExt;
 use log::{debug, info, warn};
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::sleep};
 
-use crate::modules::config::Config;
+use crate::{modules::config::Config, types::pending_tx_hash::PendingTx};
 
 /// Watches for pending transactions on the blockchain and forwards them to a channel
 pub struct PendingTransactionWatcher {
@@ -25,7 +25,7 @@ impl PendingTransactionWatcher {
     ///
     /// # Returns
     /// * `Result<()>` - Success or error of the watcher operation
-    pub async fn run(self, pending_tx_hash_sender: mpsc::Sender<FixedBytes<32>>) -> Result<()> {
+    pub async fn run(self, pending_tx_sender: mpsc::Sender<PendingTx>) -> Result<()> {
         let provider = self.config.provider.clone();
 
         // Wait for application initialization
@@ -36,12 +36,13 @@ impl PendingTransactionWatcher {
 
         let sub = provider.subscribe_pending_transactions().await?;
         let mut stream = sub.into_stream();
-        let sender = pending_tx_hash_sender.clone();
+        let sender = pending_tx_sender.clone();
 
         info!("Successfully established pending transaction stream");
         while let Some(tx_hash) = stream.next().await {
             debug!("New pending transaction detected [hash: {}]", tx_hash);
-            if let Err(e) = sender.send(tx_hash).await {
+            let pending_tx = PendingTx::new(tx_hash);
+            if let Err(e) = sender.send(pending_tx).await {
                 warn!("Failed to forward pending transaction hash: {}", e);
                 continue;
             }

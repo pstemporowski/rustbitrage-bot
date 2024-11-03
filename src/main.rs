@@ -36,14 +36,14 @@ async fn main() -> Result<()> {
 
     info!("Initializing Modules...");
     let mem_pool_watcher = MempoolWatcher::new(config.clone());
-    let blocks_updater = BlockWatcher::new(config.clone());
+    let block_watcher = BlockWatcher::new(config.clone());
     let tx_watcher = PendingTransactionWatcher::new(config.clone());
     let pending_tx_processor = PendingTransactionProcessor::new(config.clone());
 
     info!("Spawning Tasks...");
     let handles: Vec<JoinHandle<Result<()>>> = vec![
         tokio::spawn(async move { mem_pool_watcher.run().await }),
-        tokio::spawn(async move { blocks_updater.run().await }),
+        tokio::spawn(async move { block_watcher.run().await }),
         tokio::spawn(async move { tx_watcher.run(pending_tx_sender).await }),
         tokio::spawn(async move { pending_tx_processor.run(&mut pending_tx_receiver).await }),
     ];
