@@ -1,11 +1,12 @@
-/// Module for watching mempool and managing AMM state changes
-use std::{path::Path, str::FromStr, sync::Arc};
-
-use alloy::{
-    primitives::{address, Address, U256},
-    providers::RootProvider,
-    pubsub::PubSubFrontend,
+use crate::modules::config::Config;
+use crate::modules::graph::Node;
+use crate::utils::constants::{
+    MIN_USD_FACTORY_THRESHOLD, TESTING_CHECKPOINT_PATH, USDC, WETH, WETH_USDC_PAIR, WETH_VALUE,
 };
+use alloy::primitives::{Address, U256};
+use alloy::providers::{Provider, RootProvider};
+use alloy::pubsub::PubSubFrontend;
+use amms::sync::checkpoint::Checkpoint;
 use amms::{
     amm::{
         factory::Factory,
@@ -16,20 +17,13 @@ use amms::{
     state_space::StateSpaceManager,
     sync::{checkpoint::sync_amms_from_checkpoint, sync_amms},
 };
-use dashmap::DashMap;
 use eyre::Result;
+use futures::future::join_all;
 use log::{debug, info};
-use petgraph::graph::Graph;
 use rayon::prelude::*;
-use tokio::{
-    sync::{mpsc::Receiver, Mutex},
-    time::Instant,
-};
-
-use crate::{
-    modules::config::Config,
-    utils::constants::{MIN_USD_FACTORY_THRESHOLD, USDC, WETH, WETH_USDC_PAIR, WETH_VALUE},
-};
+use std::fs::File;
+use std::{path::Path, str::FromStr, sync::Arc};
+use tokio::{sync::mpsc::Receiver, time::Instant};
 
 /// Main struct responsible for watching mempool and managing AMM state
 pub struct MempoolWatcher {
@@ -43,15 +37,6 @@ impl MempoolWatcher {
     }
 
     /// Runs the MempoolWatcher service, which is responsible for watching the mempool and managing AMM state changes.
-    ///
-    /// This function performs the following steps:
-    /// 1. Synchronizes or loads AMMs from a checkpoint file.
-    /// 2. Initializes the pool map with the synchronized AMMs.
-    /// 3. Builds the initial token graph.
-    /// 4. Sets up a subscription for state changes.
-    /// 5. Enters a main loop to process state changes, updating the token graph as necessary.
-    ///
-    /// The function returns a `Result` indicating whether the service ran successfully.
     pub async fn run(&self) -> Result<()> {
         info!("Starting MempoolWatcher service");
         let now = Instant::now();
@@ -59,235 +44,175 @@ impl MempoolWatcher {
 
         let provider = self.config.provider.clone();
         let pools_map = self.config.app_state.pools_map.clone();
-        let factories = vec![
-            Factory::UniswapV2Factory(UniswapV2Factory::new(
-                address!("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"),
-                10207858,
-                300,
-            )),
-            Factory::UniswapV2Factory(UniswapV2Factory::new(
-                address!("C0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac"),
-                10794229,
-                300,
-            )),
-        ];
 
-        // Synchronize or load AMMs from checkpoint
         debug!("Starting AMM synchronization process");
         let (amms, latest_synced_block) = self
-            .sync_or_load_amms(provider.clone(), factories.clone(), checkpoint_path)
+            .get_amms_and_latest_block(provider.clone(), checkpoint_path)
             .await?;
 
-        info!("Filtering AMMs below USD threshold");
-        let amms_before_filtering = amms.len();
-        let amms = self
-            .filter_amms(amms, factories, MIN_USD_FACTORY_THRESHOLD, provider.clone())
-            .await?;
-
-        let amms_after_filtering = amms.len();
-        info!("AMMs after filtering: {}", amms_after_filtering);
-        info!("AMMs before filtering: {}", amms_before_filtering);
-
-        // Initialize pool map with synchronized AMMs
-        debug!("Initializing pool map with {} AMMs", amms.len());
-        amms.par_iter().for_each(|amm| {
-            pools_map.insert(amm.address(), amm.clone());
-        });
-
+        self.initialize_pools(&amms, &pools_map);
         info!(
             "Pool initialization completed: {} pools in {} ms",
             pools_map.len(),
             now.elapsed().as_millis()
         );
 
-        // Build initial token graph
-        debug!("Starting token graph construction");
         self.build_token_graph().await?;
         info!("Token graph construction completed");
+        let mut is_initialized = self.config.app_state.is_initialized.write().await;
+        *is_initialized = true;
+        drop(is_initialized); // Explicitly drop the write lock
+        info!("MempoolWatcher initialization completed");
 
-        // Set up subscription for state changes
-        debug!("Setting up state change subscription");
-        let mut state_change_receiver = self
+        let state_change_receiver = self
             .subscribe_pools(provider.clone(), &amms, latest_synced_block)
             .await?;
 
-        // Main loop for processing state changes
+        self.process_state_changes(provider, &pools_map, state_change_receiver)
+            .await?;
+        Ok(())
+    }
+    async fn process_state_changes(
+        &self,
+        provider: Arc<RootProvider<PubSubFrontend>>,
+        pools_map: &Arc<dashmap::DashMap<Address, AMM>>,
+        mut state_change_receiver: Receiver<Vec<Address>>,
+    ) -> Result<()> {
         info!("MempoolWatcher is now monitoring for state changes");
         while let Some(changed_addresses) = state_change_receiver.recv().await {
-            debug!("Processing {} state changes", changed_addresses.len());
+            info!("Processing {} state changes", changed_addresses.len());
             let now = Instant::now();
-            let updated_pools: Vec<AMM> = changed_addresses
-                .into_par_iter()
-                .filter_map(|addr| {
-                    if let Some(entry) = pools_map.get(&addr) {
-                        debug!("Pool {:?} has been modified", addr);
-                        Some(entry.value().clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+
+            let updated_pools = self
+                .sync_modified_pools(changed_addresses, provider.clone(), pools_map)
+                .await;
 
             if !updated_pools.is_empty() {
-                debug!(
-                    "Updating token graph with {} modified pools",
-                    updated_pools.len()
-                );
                 self.update_token_graph(&updated_pools).await?;
                 info!(
-                    "Token graph update completed in {} ms",
+                    "Token graph updated with {} modified pools in {} ms",
+                    updated_pools.len(),
                     now.elapsed().as_millis()
                 );
             }
         }
-
         Ok(())
     }
 
-    /// Builds the initial token graph for the application.
-    ///
-    /// This function initializes the token graph data structures, collects all unique tokens from the registered AMMs, adds the tokens as nodes to the graph, and calculates and adds the edge weights based on the exchange rates between the tokens.
-    ///
-    /// The resulting token graph and token indices are stored in the application state for later use.
-    async fn build_token_graph(&self) -> Result<()> {
-        debug!("Initializing token graph data structures");
-        let graph = Arc::new(Mutex::new(Graph::<Address, f64>::new()));
-        let indices_map = Arc::new(DashMap::new());
-        let tokens_map: DashMap<Address, ()> = DashMap::new();
-        let pools_map = self.config.app_state.pools_map.clone();
-
-        // Collect unique tokens from all pools
-        debug!("Collecting unique tokens from pools");
-        pools_map.par_iter().for_each(|entry| {
-            let amm = entry.value();
-            let tokens = amm.tokens();
-            let token0 = tokens[0];
-            let token1 = tokens[1];
-
-            tokens_map.insert(token0, ());
-            tokens_map.insert(token1, ());
+    fn initialize_pools(&self, amms: &[AMM], pools_map: &Arc<dashmap::DashMap<Address, AMM>>) {
+        debug!("Initializing pool map with {} AMMs", amms.len());
+        amms.par_iter().for_each(|amm| {
+            pools_map.insert(amm.address(), amm.clone());
         });
+    }
 
-        // Add tokens as graph nodes
-        debug!("Adding {} tokens as graph nodes", tokens_map.len());
-        for entry in tokens_map.iter() {
-            let token = *entry.key();
-            let mut graph = graph.lock().await;
-            let index = graph.add_node(token);
-            indices_map.insert(token, index);
+    async fn sync_modified_pools(
+        &self,
+        changed_addresses: Vec<Address>,
+        provider: Arc<RootProvider<PubSubFrontend>>,
+        pools_map: &Arc<dashmap::DashMap<Address, AMM>>,
+    ) -> Vec<AMM> {
+        let updated_pools_futures: Vec<_> = changed_addresses
+            .into_iter()
+            .filter_map(|addr| {
+                pools_map.get(&addr).map(|entry| {
+                    let mut pool = entry.value().clone();
+                    let provider_clone = provider.clone();
+                    tokio::spawn(async move {
+                        match pool.sync(provider_clone).await {
+                            Ok(_) => Some(pool),
+                            Err(e) => {
+                                debug!("Error syncing pool {:?}: {:?}", addr, e);
+                                None
+                            }
+                        }
+                    })
+                })
+            })
+            .collect();
+
+        if updated_pools_futures.is_empty() {
+            return vec![];
         }
 
-        // Calculate and add edge weights based on exchange rates
-        debug!("Calculating and adding edge weights");
-        for entry in pools_map.iter() {
-            let amm = entry.value();
-            let tokens = amm.tokens();
-            let token0 = tokens[0];
-            let token1 = tokens[1];
+        debug!(
+            "Syncing {} modified pools concurrently",
+            updated_pools_futures.len()
+        );
 
-            let index0 = indices_map.get(&token0).unwrap();
-            let index1 = indices_map.get(&token1).unwrap();
+        join_all(updated_pools_futures)
+            .await
+            .into_iter()
+            .filter_map(|r| r.ok().and_then(|x| x))
+            .collect()
+    }
+    async fn get_amms_and_latest_block(
+        &self,
+        provider: Arc<RootProvider<PubSubFrontend>>,
+        checkpoint_path: &str,
+    ) -> Result<(Vec<AMM>, u64)> {
+        let factories = vec![Factory::UniswapV2Factory(UniswapV2Factory::new(
+            Address::from_str("C0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac").unwrap(),
+            10794229,
+            300,
+        ))];
 
-            // Calculate and add edges for both directions
-            if let Ok(rate) = amm.calculate_price(token0, token1) {
-                let weight = -rate.ln();
-                let mut graph = graph.lock().await;
-                graph.update_edge(*index0, *index1, weight);
-            }
+        if self.config.is_testing {
+            let cp = self.load_testing_checkpoint()?;
+            let latest_block_number = provider.get_block_number().await?;
+            Ok((cp.amms, latest_block_number))
+        } else {
+            let (amms, latest_synced_block) = self
+                .sync_or_load_amms(provider.clone(), factories.clone(), checkpoint_path)
+                .await?;
 
-            if let Ok(rate) = amm.calculate_price(token1, token0) {
-                let weight = -rate.ln();
-                let mut graph = graph.lock().await;
-                graph.update_edge(*index1, *index0, weight);
-            }
+            info!("Filtering AMMs below USD threshold");
+            let amms_before_filtering = amms.len();
+            let amms = self
+                .filter_amms(
+                    amms,
+                    factories.clone(),
+                    MIN_USD_FACTORY_THRESHOLD,
+                    provider.clone(),
+                )
+                .await?;
+
+            self.write_testing_checkpoint(&factories, &amms, latest_synced_block)?;
+
+            let amms_after_filtering = amms.len();
+            info!("AMMs after filtering: {}", amms_after_filtering);
+            info!("AMMs before filtering: {}", amms_before_filtering);
+            Ok((amms, latest_synced_block))
         }
+    }
 
-        // Update application state with new graph
-        debug!("Finalizing token graph initialization");
-        let token_graph = self.config.app_state.token_graph.clone();
-        let token_indices = self.config.app_state.token_indices.clone();
+    fn write_testing_checkpoint(
+        &self,
+        factories: &Vec<Factory>,
+        amms: &Vec<AMM>,
+        latest_synced_block: u64,
+    ) -> Result<()> {
+        let cp = Checkpoint::new(
+            Instant::now().elapsed().as_secs() as usize,
+            latest_synced_block,
+            factories.to_vec(),
+            amms.to_vec(),
+        );
 
-        let mut token_graph = token_graph.write().await;
-        *token_graph = Arc::try_unwrap(graph).unwrap().into_inner();
-
-        let mut token_indices = token_indices.write().await;
-        *token_indices = Arc::try_unwrap(indices_map).unwrap();
-
-        let mut is_initialized = self.config.app_state.is_initialized.write().await;
-        *is_initialized = true;
+        let file = File::create(TESTING_CHECKPOINT_PATH)?;
+        serde_json::to_writer(file, &cp)?;
 
         Ok(())
     }
 
-    /// Updates the token graph with the provided updated AMMs.
-    ///
-    /// This function takes a slice of updated AMMs and updates the token graph and token indices accordingly. It adds any new tokens to the graph, and updates the edge weights based on the new exchange rates.
-    ///
-    /// # Arguments
-    /// * `updated_pools` - A slice of updated AMM instances.
-    ///
-    /// # Returns
-    /// A `Result` indicating whether the update was successful.
-    async fn update_token_graph(&self, updated_pools: &[AMM]) -> Result<()> {
-        debug!("Updating token graph with {} pools", updated_pools.len());
-        let token_graph = self.config.app_state.token_graph.clone();
-        let token_indices = self.config.app_state.token_indices.clone();
-        let mut token_graph = token_graph.write().await;
-        let token_indices = token_indices.write().await;
-
-        for amm in updated_pools {
-            let tokens = amm.tokens();
-            let token0 = tokens[0];
-            let token1 = tokens[1];
-
-            // Add new tokens to graph if they don't exist
-            let index0 = match token_indices.get(&token0) {
-                Some(index) => *index,
-                None => {
-                    debug!("Adding new token to graph: {:?}", token0);
-                    let idx = token_graph.add_node(token0);
-                    token_indices.insert(token0, idx);
-                    idx
-                }
-            };
-            let index1 = match token_indices.get(&token1) {
-                Some(index) => *index,
-                None => {
-                    debug!("Adding new token to graph: {:?}", token1);
-                    let idx = token_graph.add_node(token1);
-                    token_indices.insert(token1, idx);
-                    idx
-                }
-            };
-
-            // Update edge weights based on new exchange rates
-            if let Ok(rate) = amm.calculate_price(token0, token1) {
-                let weight = -rate.ln();
-                token_graph.update_edge(index0, index1, weight);
-            }
-
-            if let Ok(rate) = amm.calculate_price(token1, token0) {
-                let weight = -rate.ln();
-                token_graph.update_edge(index1, index0, weight);
-            }
-        }
-
-        Ok(())
+    fn load_testing_checkpoint(&self) -> Result<Checkpoint> {
+        let file = File::open(TESTING_CHECKPOINT_PATH)?;
+        let cp: Checkpoint = serde_json::from_reader(file)?;
+        Ok(cp)
     }
 
     /// Subscribes to state changes in the provided AMMs starting from the latest synced block.
-    ///
-    /// This function creates a new `StateSpaceManager` instance with the provided AMMs and provider, and then
-    /// subscribes to state changes starting from the latest synced block plus one. It returns a `Receiver`
-    /// that can be used to receive the updated addresses of the AMMs.
-    ///
-    /// # Arguments
-    /// * `provider` - An `Arc<RootProvider<PubSubFrontend>>` instance used for interacting with the blockchain.
-    /// * `amms` - A slice of `AMM` instances to subscribe to.
-    /// * `latest_synced_block` - The latest block number that has been synced.
-    ///
-    /// # Returns
-    /// A `Receiver` that can be used to receive the updated addresses of the AMMs.
+
     async fn subscribe_pools(
         &self,
         provider: Arc<RootProvider<PubSubFrontend>>,
@@ -301,22 +226,14 @@ impl MempoolWatcher {
         let subscriber = StateSpaceManager::new(amms.to_vec(), provider);
 
         let (receiver, _) = subscriber
-            .subscribe_state_changes(latest_synced_block + 1, 100)
+            .subscribe_state_changes(latest_synced_block, 100)
             .await?;
 
         Ok(receiver)
     }
 
     /// Synchronizes or loads AMMs from a checkpoint file.
-    ///
-    /// This function checks for the existence of a checkpoint file at the provided path. If the file exists, it loads the AMMs and the last synced block number from the checkpoint. If the file does not exist, it synchronizes the AMMs from the chain using the provided factory configurations.
-    ///
-    /// # Arguments
-    /// * `provider` - An `Arc<RootProvider<PubSubFrontend>>` instance used for interacting with the blockchain.
-    /// * `checkpoint_path` - The path to the checkpoint file.
-    ///
-    /// # Returns
-    /// A tuple containing the vector of AMMs and the last synced block number.
+
     async fn sync_or_load_amms(
         &self,
         provider: Arc<RootProvider<PubSubFrontend>>,
@@ -374,5 +291,64 @@ impl MempoolWatcher {
 
         Ok(amms)
         // 10 weth
+    }
+
+    /// Builds the token graph by iterating over all pools and adding nodes and edges.
+    ///
+    /// This method collects all the pools from the pools map, and then iterates over them in parallel to build the nodes and edges of the token graph. For each pool, it adds nodes for the two tokens, and then calculates the weights for the edges between the tokens based on the pool reserves.
+    ///
+    /// # Returns
+    /// A `Result` indicating whether the token graph was successfully built.
+    pub async fn build_token_graph(&self) -> Result<()> {
+        let pools_map = self.config.app_state.pools_map.clone();
+        let token_graph = self.config.app_state.token_graph.clone();
+        let token_graph = token_graph.write().await;
+
+        // Collect all pools
+        let pools: Vec<AMM> = pools_map
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+
+        // Iterate over the pools in parallel to build nodes and edges
+        pools.par_iter().for_each(|amm| {
+            let tokens = amm.tokens();
+            let token0 = tokens[0];
+            let token1 = tokens[1];
+
+            // Add nodes for tokens if they don't exist
+            token_graph.add_node(Node { address: token0 });
+            token_graph.add_node(Node { address: token1 });
+
+            // Calculate weights for edges based on pool reserves
+            if let Ok(rate0_to_1) = amm.calculate_price(token0, token1) {
+                let weight = -rate0_to_1.ln();
+                token_graph.upsert_edge(&token0, &token1, weight);
+            }
+
+            if let Ok(rate1_to_0) = amm.calculate_price(token1, token0) {
+                let weight = -rate1_to_0.ln();
+
+                token_graph.upsert_edge(&token1, &token0, weight);
+            }
+        });
+
+        Ok(())
+    }
+    /// Updates the token graph with modified pools.
+    ///
+    /// This method updates the existing token graph using the latest reserve data from modified pools. It recalculates
+    /// the weights of edges connected to the modified pools, ensuring that the graph remains up-to-date for accurate
+    /// arbitrage detection.
+    ///
+    /// # Arguments
+    /// * `updated_pools` - A list of AMMs that have changed and need to be updated in the graph.
+    pub async fn update_token_graph(&self, updated_pools: &Vec<AMM>) -> Result<()> {
+        let token_graph = self.config.app_state.token_graph.clone();
+        let token_graph = token_graph.write().await;
+
+        token_graph.update_by_pools(updated_pools);
+        drop(token_graph);
+        Ok(())
     }
 }

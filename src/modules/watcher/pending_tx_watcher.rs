@@ -30,7 +30,7 @@ impl PendingTransactionWatcher {
 
         // Wait for application initialization
         while !*self.config.app_state.is_initialized.read().await {
-            sleep(Duration::from_secs(10)).await;
+            sleep(Duration::from_secs(1)).await;
         }
         info!("PendingTransactionWatcher initialized and starting subscription to pending transactions");
 
@@ -46,7 +46,6 @@ impl PendingTransactionWatcher {
                 warn!("Failed to forward pending transaction hash: {}", e);
                 continue;
             }
-            debug!("Successfully forwarded transaction hash to processing channel");
         }
 
         warn!("Pending transaction stream terminated unexpectedly");

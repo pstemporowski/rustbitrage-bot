@@ -28,6 +28,7 @@ impl BlockWatcher {
     pub async fn run(&self) -> Result<()> {
         // Wait for application initialization
         while !*self.config.app_state.is_initialized.read().await {
+            debug!("Waiting for application initialization...");
             sleep(Duration::from_secs(1)).await;
         }
         info!("BlocksUpdater initialized and starting subscription to new blocks");
