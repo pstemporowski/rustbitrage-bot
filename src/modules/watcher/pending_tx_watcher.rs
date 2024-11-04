@@ -1,7 +1,7 @@
 use alloy::providers::Provider;
 use eyre::Result;
 use futures::StreamExt;
-use log::{debug, info, warn};
+use log::{info, warn};
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, time::sleep};
 
@@ -40,7 +40,6 @@ impl PendingTransactionWatcher {
 
         info!("Successfully established pending transaction stream");
         while let Some(tx_hash) = stream.next().await {
-            debug!("New pending transaction detected [hash: {}]", tx_hash);
             let pending_tx = PendingTx::new(tx_hash);
             if let Err(e) = sender.send(pending_tx).await {
                 warn!("Failed to forward pending transaction hash: {}", e);

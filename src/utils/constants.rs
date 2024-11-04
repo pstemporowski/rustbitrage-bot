@@ -9,3 +9,12 @@ pub const WETH_VALUE: u128 = 100000000000000000_u128;
 
 // Paths for checkpoint files
 pub const TESTING_CHECKPOINT_PATH: &str = ".dev-cfmms-checkpoint.json";
+
+pub const SWAP_FUNCTION_SIGNATURES: &[&[u8]] = &[
+    // Uniswap V2 pair swap function signature
+    &[0x02, 0x2c, 0x0d, 0x9f],
+    // Add other swap function selectors if needed
+];
+
+// Add at the end
+pub const MAX_ITERATIONS: usize = 10;

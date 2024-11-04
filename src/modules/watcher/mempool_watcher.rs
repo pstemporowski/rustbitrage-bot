@@ -152,8 +152,8 @@ impl MempoolWatcher {
         checkpoint_path: &str,
     ) -> Result<(Vec<AMM>, u64)> {
         let factories = vec![Factory::UniswapV2Factory(UniswapV2Factory::new(
-            Address::from_str("C0AEe478e3658e2610c5F7A4A2E1777cE9e4f2Ac").unwrap(),
-            10794229,
+            Address::from_str("5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f").unwrap(),
+            10000835,
             300,
         ))];
 
@@ -323,13 +323,13 @@ impl MempoolWatcher {
             // Calculate weights for edges based on pool reserves
             if let Ok(rate0_to_1) = amm.calculate_price(token0, token1) {
                 let weight = -rate0_to_1.ln();
-                token_graph.upsert_edge(&token0, &token1, weight);
+                token_graph.upsert_edge(&token0, &token1, weight, amm.address());
             }
 
             if let Ok(rate1_to_0) = amm.calculate_price(token1, token0) {
                 let weight = -rate1_to_0.ln();
 
-                token_graph.upsert_edge(&token1, &token0, weight);
+                token_graph.upsert_edge(&token1, &token0, weight, amm.address());
             }
         });
 

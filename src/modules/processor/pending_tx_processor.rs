@@ -1,16 +1,15 @@
-use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::modules::config::Config;
 use crate::types::pending_tx_hash::PendingTx;
 use crate::utils::call_frame::get_call_frame;
-use crate::utils::constants::WETH;
-use crate::utils::interaction::is_pool_interaction;
-use alloy::primitives::Address;
+use crate::utils::interaction::{decode_swap_function, get_pool_interactions};
+use alloy::primitives::{Address, Uint};
 use alloy::providers::{Provider, RootProvider};
 use alloy::pubsub::PubSubFrontend;
+use amms::amm::AMM;
 use eyre::Result;
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::Semaphore;
@@ -59,6 +58,12 @@ impl PendingTransactionProcessor {
 
         Ok(())
     }
+}
+
+pub struct Swap {
+    pub path: Vec<Address>,
+    pub amount_in: Uint<256, 4>,
+    pub pools: Vec<AMM>,
 }
 
 /// Processes a single pending transaction, focusing on Uniswap V2 interactions and related DeFi operations.
@@ -120,35 +125,78 @@ async fn process_transaction(
 
         // Check and process Uniswap V2 interactions
         let pools_map = config.app_state.pools_map.clone();
-        if is_pool_interaction(&call_frame, &pools_map) {
-            debug!("Transaction {} is a pool interaction. Processing...", hash);
+        let mut interacted_pools = Vec::new();
+        debug!("Analyzing pool interactions for transaction {}", hash);
+        get_pool_interactions(&call_frame, &pools_map, &mut interacted_pools);
+        if !interacted_pools.is_empty() {
+            info!("Transaction {} is a pool interaction. Processing...", hash);
+            debug!("Found {} interacting pools", interacted_pools.len());
 
-            let token_graph = config.app_state.token_graph.clone();
-            let weth_address = Address::from_str(WETH)?;
+            if let Some(swap_info) = decode_swap_function(&tx)? {
+                info!(
+                    "Successfully decoded swap function for transaction {}",
+                    hash
+                );
+                // Prepare the swaps struct
+                let swaps = Swap {
+                    path: swap_info.path,
+                    amount_in: swap_info.amount_in,
+                    pools: interacted_pools.clone(),
+                };
 
-            // Run SPFA starting from WETH
-            let cycles = {
-                let graph = token_graph.read().await;
-                graph.find_negative_cycles_from_weth(weth_address)
-            };
-            let pool_detection_time = now.elapsed();
-            let time_since_received = received_at.elapsed();
+                // Simulate swaps and check for arbitrage opportunities
+                let pools_map = config.app_state.pools_map.clone();
+                let opportunities = {
+                    let token_graph = config.app_state.token_graph.clone();
+                    let graph = token_graph.read().await;
 
-            if !cycles.is_empty() {
-                for (i, path) in cycles.iter().enumerate() {
-                    info!("Arbitrage opportunity {} detected: {:?}", i + 1, path);
+                    graph
+                        .simulate_swaps_and_check_arbitrage(&swaps, &pools_map)
+                        .unwrap_or_else(|e| {
+                            warn!(
+                                "Failed to find arbitrage opportunities after simulation: {}",
+                                e
+                            );
+                            Vec::new()
+                        })
+                };
+
+                let pool_detection_time = now.elapsed();
+                let time_since_received = received_at.elapsed();
+
+                if !opportunities.is_empty() {
+                    for (i, opportunity) in opportunities.iter().enumerate() {
+                        info!(
+                            "Arbitrage opportunity {} detected: {:?}",
+                            i + 1,
+                            opportunity.path
+                        );
+                        debug!(
+                            "Arbitrage path {} length: {}",
+                            i + 1,
+                            opportunity.path.len()
+                        );
+
+                        let optimal_amount_in = opportunity.optimal_amount_in;
+                        let expected_profit = opportunity.expected_profit;
+                        info!("Optimal amount in: {}", optimal_amount_in);
+                        info!("Expected profit: {}", expected_profit);
+                    }
+                } else {
+                    debug!("No arbitrage opportunity found after simulation.");
                 }
-                // Proceed to compute potential profit and execute trade
-            } else {
-                debug!("No arbitrage opportunity found.");
-            }
 
-            info!(
-                "Processed transaction: {} in {} ms (total time since received: {} ms)",
-                tx.hash,
-                pool_detection_time.as_millis(),
-                time_since_received.as_millis()
-            );
+                info!(
+                    "Processed transaction: {} in {} ms (total time since received: {} ms)",
+                    tx.hash,
+                    pool_detection_time.as_millis(),
+                    time_since_received.as_millis()
+                );
+            } else {
+                debug!("Failed to decode swap function for transaction {}", hash);
+            }
+        } else {
+            debug!("No pool interactions found for transaction {}", hash);
         }
     } else {
         debug!(

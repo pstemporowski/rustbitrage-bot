@@ -25,8 +25,6 @@ pub async fn get_call_frame(
     tx: Transaction,
     provider: Arc<RootProvider<PubSubFrontend>>,
 ) -> eyre::Result<CallFrame> {
-    debug!("Getting call frame for transaction: {:?}", tx.hash);
-
     // Configure tracing options - disable memory, return data, storage and stack for performance
     let trace_options = GethDefaultTracingOptions {
         enable_memory: Some(false),
@@ -61,12 +59,10 @@ pub async fn get_call_frame(
     {
         Ok(trace) => trace,
         Err(e) => {
-            error!("Failed to get geth trace: {}", e);
+            debug!("Failed to get geth trace: {}", e);
             return Err(e.into());
         }
     };
-
-    debug!("Successfully retrieved geth trace");
 
     // Convert trace result into call frame
     let call_frame = match geth_trace.try_into_call_frame() {

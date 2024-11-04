@@ -15,7 +15,8 @@ futures = "0.3"
 dashmap = {version= "6.1.0", features = ["rayon"]}
 eyre = "0.6"
 amms = {git = "https://github.com/darkforestry/amms-rs.git"}
-alloy = {version = "0.5", features = ["provider-ws", "rpc-types-trace", "rpc-types-debug"]}
+alloy = {version = "0.5", features = ["provider-ws", "rpc-types-trace", "rpc-types-debug" ]}
+rug = "1.26.1"
 
 
 [profile.release]
