@@ -13,8 +13,6 @@ use log::{debug, info, warn};
 
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::Semaphore;
-use tokio::time::Instant;
-
 /// Processes pending transactions from the mempool, specifically focusing on
 /// Uniswap V2 interactions and related DeFi operations.
 pub struct PendingTransactionProcessor {
@@ -80,7 +78,6 @@ async fn process_transaction(
     provider: Arc<RootProvider<PubSubFrontend>>,
     config: Arc<Config>,
 ) -> eyre::Result<()> {
-    let now = Instant::now();
     let current_block = *config.app_state.block_number.read().await;
     let current_base_fee = *config.app_state.next_block_base_fee.read().await;
     let hash = pending_tx.hash;
@@ -160,36 +157,17 @@ async fn process_transaction(
                             Vec::new()
                         })
                 };
+                info!(
+                    "Found {} arbitrage opportunities for transaction {}",
+                    opportunities.len(),
+                    hash
+                );
 
-                let pool_detection_time = now.elapsed();
                 let time_since_received = received_at.elapsed();
 
-                if !opportunities.is_empty() {
-                    for (i, opportunity) in opportunities.iter().enumerate() {
-                        info!(
-                            "Arbitrage opportunity {} detected: {:?}",
-                            i + 1,
-                            opportunity.path
-                        );
-                        debug!(
-                            "Arbitrage path {} length: {}",
-                            i + 1,
-                            opportunity.path.len()
-                        );
-
-                        let optimal_amount_in = opportunity.optimal_amount_in;
-                        let expected_profit = opportunity.expected_profit;
-                        info!("Optimal amount in: {}", optimal_amount_in);
-                        info!("Expected profit: {}", expected_profit);
-                    }
-                } else {
-                    debug!("No arbitrage opportunity found after simulation.");
-                }
-
                 info!(
-                    "Processed transaction: {} in {} ms (total time since received: {} ms)",
+                    "Processed transaction: {} in {} ms",
                     tx.hash,
-                    pool_detection_time.as_millis(),
                     time_since_received.as_millis()
                 );
             } else {
