@@ -157,11 +157,15 @@ async fn process_transaction(
                             Vec::new()
                         })
                 };
-                info!(
-                    "Found {} arbitrage opportunities for transaction {}",
-                    opportunities.len(),
-                    hash
-                );
+
+                opportunities.iter().for_each(|op| {
+                    info!(
+                        "Arbitrage opportunity: {} -> {} with profit of {} ETH",
+                        op.path[0],
+                        op.path[op.path.len() - 1],
+                        op.expected_profit
+                    );
+                });
 
                 let time_since_received = received_at.elapsed();
 

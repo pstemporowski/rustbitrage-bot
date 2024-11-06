@@ -8,7 +8,6 @@ use amms::amm::{AutomatedMarketMaker, AMM};
 use dashmap::{DashMap, DashSet};
 use eyre::eyre;
 use eyre::Result;
-use log::warn;
 use log::{error, info};
 use rayon::prelude::*;
 use std::{str::FromStr, sync::Arc, time::Instant};
@@ -73,6 +72,14 @@ impl Graph {
             .collect()
     }
 
+    /// Updates the graph by processing the given pools.
+    ///
+    /// This function iterates over the provided pools, calculates the price rate between each pair of tokens,
+    /// and then upserts an edge in the graph with the negative logarithm of the price rate as the weight.
+    /// The pool address is also stored as part of the edge.
+    ///
+    /// # Parameters
+    /// - `pools`: A vector of AMM pools to process.
     pub fn update_by_pools(&self, pools: &Vec<AMM>) {
         let start = Instant::now();
         pools.par_iter().for_each(|pool| {
@@ -93,6 +100,18 @@ impl Graph {
         info!("update_by_pools took: {:?}", start.elapsed());
     }
 
+    /// Finds all negative cycles in the graph that start and end with the WETH token.
+    ///
+    /// This function performs a modified Bellman-Ford algorithm to detect negative cycles in the graph.
+    /// It first initializes the distances and predecessors for each node, setting the distance for the
+    /// WETH node to 0. It then repeatedly relaxes the edges, updating the distances and predecessors.
+    /// Finally, it checks for any edges where the new distance is less than the current distance,
+    /// indicating a negative cycle. For each negative cycle found, it builds the cycle and checks that
+    /// it starts and ends with the WETH token before adding it to the result.
+    ///
+    /// # Returns
+    /// A `Result` containing a vector of vectors of `Address`, where each inner vector represents a
+    /// negative cycle that starts and ends with the WETH token.
     pub fn find_negative_cycles_from_weth(&self) -> Result<Vec<Vec<Address>>> {
         let start = Instant::now();
         let weth = Address::from_str(WETH)?;
@@ -159,6 +178,21 @@ impl Graph {
         Ok(negative_cycles.into_iter().collect())
     }
 
+    /// Simulates the effect of a series of swaps on the graph, and checks for any negative cycles that
+    /// could represent arbitrage opportunities.
+    ///
+    /// This function takes a set of swaps to simulate, and the current state of the AMM pools. It
+    /// updates the edge weights in a cloned graph based on the simulated swap effects, then runs
+    /// negative cycle detection on the updated graph. For each negative cycle found, it calculates the
+    /// optimal trade amount and expected profit.
+    ///
+    /// # Arguments
+    /// * `swaps` - The set of swaps to simulate.
+    /// * `pools_map` - A map of AMM pools, keyed by the pool address.
+    ///
+    /// # Returns
+    /// A vector of `ArbitrageOpportunity` structs, each representing a negative cycle that could be
+    /// exploited for arbitrage.
     pub fn simulate_swaps_and_check_arbitrage(
         &self,
         swaps: &Swap,
@@ -225,6 +259,19 @@ impl Graph {
         Ok(opportunities)
     }
 
+    /// Builds a negative cycle from the given start address and predecessor map.
+    ///
+    /// This function traverses the graph using the predecessor map, starting from the given
+    /// `start` address. It keeps track of the visited nodes in a `DashMap` to detect cycles.
+    /// Once a cycle is detected, the function returns the nodes in the cycle in reverse order.
+    ///
+    /// # Arguments
+    /// * `start` - The starting address for the cycle detection.
+    /// * `predecessors` - A `DashMap` containing the predecessor information for each node.
+    ///
+    /// # Returns
+    /// * `Some(Vec<Address>)` if a negative cycle is found, containing the nodes in the cycle.
+    /// * `None` if no negative cycle is found.
     fn build_negative_cycle(
         &self,
         start: Address,
@@ -269,131 +316,130 @@ impl Graph {
         info!("convert_rates_to_weights took: {:?}", start.elapsed());
     }
 
+    /// Finds the optimal trade amount and the corresponding profit for a given arbitrage cycle.
+    ///
+    /// This function performs a binary search to find the optimal trade amount that maximizes the
+    /// profit for the given arbitrage cycle. It starts with a range of 1 wei to the maximum
+    /// possible U256 value, and iteratively narrows down the search range to find the optimal
+    /// amount.
+    ///
+    /// The function first attempts to calculate the profit for the midpoint of the current search
+    /// range. If the profit is greater than the current best profit, the optimal amount and best
+    /// profit are updated. Otherwise, the search range is adjusted based on the result.
+    ///
+    /// After the binary search, the function performs a fine-tuning step by checking a small
+    /// range around the optimal amount found, to ensure the best possible profit is returned.
+    ///
+    /// # Arguments
+    /// * `cycle` - A slice of addresses representing the arbitrage cycle.
+    /// * `pools_map` - A reference to a `DashMap` containing the AMM pools.
+    ///
+    /// # Returns
+    /// * A tuple containing the optimal trade amount and the corresponding profit.
+    /// * An error if no profitable arbitrage was found.
     pub fn find_optimal_trade_amount(
         &self,
         cycle: &[Address],
         pools_map: &DashMap<Address, AMM>,
     ) -> Result<(U256, U256)> {
+        if cycle.first() != cycle.last() {
+            return Err(eyre!("Cycle must start and end with the same token"));
+        }
+
         let start = Instant::now();
-        // Initialize variables
         let mut optimal_amount = U256::ZERO;
         let mut best_profit = U256::ZERO;
 
-        // Define search bounds
-        let mut left = U256::from(1); // Start from 1 wei
-        let mut right = U256::MAX; // Maximum possible U256 value
+        // More realistic initial bounds based on typical DEX liquidity
+        let mut left = U256::from(1) * U256::from(10).pow(U256::from(15)); // 0.001 ETH in wei
+        let mut right = U256::from(1) * U256::from(10).pow(U256::from(21)); // 1000 ETH in wei
+                                                                            // Perform binary search to find the optimal trade amount
+        while left < right {
+            let mid = left + (right - left) / U256::from(2);
 
-        // Perform binary search to find the optimal trade amount
-        for _ in 0..64 {
-            // Calculate the midpoint using a safer method
-            let mid = left.saturating_add(right) / U256::from(2);
-
-            // Break the loop if the search interval is too small
-            if mid == left || mid == right {
-                break;
-            }
-
-            // Attempt to calculate profit for the midpoint amount
             match self.calculate_profit(cycle, mid, pools_map) {
                 Ok(profit) => {
+                    // Check if we found a better profit
                     if profit > best_profit {
                         best_profit = profit;
                         optimal_amount = mid;
-                        left = mid;
+                        left = mid + U256::from(1);
                     } else {
                         right = mid;
                     }
                 }
-                Err(_) => {
-                    // If profit calculation fails, adjust the right bound
-                    right = mid;
-                }
+                Err(_) => right = mid,
+            }
+
+            // Break if the search range becomes too small
+            if right - left < U256::from(1_000_000) {
+                // 0.000001 ETH precision
+                break;
             }
         }
 
         // If no profit was found during the binary search, return an error
         if best_profit.is_zero() {
-            return Err(eyre!("No profitable arbitrage found"));
+            return Err(eyre!(
+                "No profitable arbitrage found with {} profit",
+                best_profit
+            ));
         }
 
-        // Fine-tune the optimal amount found
-        let step = optimal_amount
-            .checked_div(U256::from(100))
-            .unwrap_or(U256::from(1));
-
-        if !step.is_zero() {
-            for i in -5i64..=5i64 {
-                let offset = step
-                    .checked_mul(U256::from(i.abs() as u64))
-                    .unwrap_or(U256::ZERO);
-                let test_amount = if i < 0 {
-                    optimal_amount.checked_sub(offset).unwrap_or(U256::ZERO)
-                } else {
-                    optimal_amount.checked_add(offset).unwrap_or(U256::MAX)
-                };
-
-                // Skip if test_amount is zero
-                if test_amount.is_zero() {
-                    continue;
-                }
-
-                // Attempt to calculate profit for the test amount
-                match self.calculate_profit(cycle, test_amount, pools_map) {
-                    Ok(profit) => {
-                        if profit > best_profit {
-                            best_profit = profit;
-                            optimal_amount = test_amount;
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Error calculating profit for fine-tuning: {}", e);
-                        continue;
-                    }
-                }
-            }
-        }
-
-        info!("find_optimal_trade_amount took: {:?}", start.elapsed());
         Ok((optimal_amount, best_profit))
     }
 
+    /// Calculates the maximum profit that can be obtained by executing a cyclic trade
+    /// on the given set of token addresses and AMM pools.
+    ///
+    /// # Arguments
+    /// - `cycle`: A slice of token addresses representing the cyclic trade.
+    /// - `amount_in`: The input amount to use for the cyclic trade.
+    /// - `pools_map`: A `DashMap` containing the AMM pools for the given token addresses.
+    ///
+    /// # Returns
+    /// A `Result` containing the maximum profit that can be obtained, or an error if
+    /// no profitable arbitrage was found or an error occurred during the calculation.
     fn calculate_profit(
         &self,
         cycle: &[Address],
         amount_in: U256,
         pools_map: &DashMap<Address, AMM>,
     ) -> Result<U256> {
-        let start = Instant::now();
         let mut amount = amount_in;
 
+        // Validate input amount
+        if amount_in.is_zero() {
+            return Err(eyre!("Invalid input amount"));
+        }
+
+        // Track each swap in the cycle
         for window in cycle.windows(2) {
             let from = window[0];
             let to = window[1];
-            let edge = match self.get_edge(&from, &to) {
-                Some(edge) => edge,
-                None => {
-                    warn!("Edge not found between {:?} and {:?}", from, to);
-                    break;
-                }
-            };
+
+            let edge = self
+                .get_edge(&from, &to)
+                .ok_or_else(|| eyre!("Edge not found between {:?} and {:?}", from, to))?;
+
             let pool = pools_map
                 .get(&edge.pool_address)
-                .ok_or(eyre!("Pool not found"))?;
+                .ok_or_else(|| eyre!("Pool not found for address: {:?}", edge.pool_address))?;
 
-            amount = pool.simulate_swap(from, to, amount)?;
-        }
-        warn!("Found  profit: {} for amount: {}", amount, amount_in);
-        // Profit is calculated as amount received minus amount spent
-        let profit = amount.checked_sub(amount_in).ok_or_else(|| {
-            warn!("Overflow occurred while calculating profit");
-            eyre!("Overflow occurred while calculating profit")
-        })?;
+            // Simulate the swap with slippage check
+            let amount_out = pool.simulate_swap(from, to, amount)?;
 
-        if profit.is_zero() {
-            return Err(eyre!("No profit found"));
+            // Verify the swap produced a valid output
+            if amount_out.is_zero() {
+                return Err(eyre!("Zero output amount in swap"));
+            }
+
+            amount = amount_out;
         }
 
-        info!("calculate_profit took: {:?}", start.elapsed());
-        Ok(profit)
+        // Calculate profit with overflow protection
+        amount
+            .checked_sub(amount_in)
+            .ok_or_else(|| eyre!("Overflow in profit calculation"))
     }
 }
