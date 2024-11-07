@@ -1,28 +1,30 @@
+use std::sync::Arc;
+
 use alloy::{
     eips::{BlockId, BlockNumberOrTag},
     providers::{ext::DebugApi, RootProvider},
     pubsub::PubSubFrontend,
     rpc::types::{
         trace::geth::{
-            CallFrame, GethDebugBuiltInTracerType, GethDebugTracerConfig, GethDebugTracerType,
-            GethDebugTracingCallOptions, GethDebugTracingOptions, GethDefaultTracingOptions,
+            CallConfig, CallFrame, GethDebugBuiltInTracerType, GethDebugTracerConfig,
+            GethDebugTracerType, GethDebugTracingCallOptions, GethDebugTracingOptions,
+            GethDefaultTracingOptions,
         },
         Transaction,
     },
 };
 use log::{debug, error};
-use std::sync::Arc;
 
-/// Retrieves a call frame for a given transaction by performing debug tracing
+/// Retrieves a call frame and logs for a given transaction by performing debug tracing
 ///
 /// # Arguments
 /// * `tx` - The transaction to trace
 /// * `provider` - The RPC provider to use for tracing
 ///
 /// # Returns
-/// * `eyre::Result<CallFrame>` - The resulting call frame or error
+/// * `eyre::Result<(CallFrame, Vec<String>)>` - The resulting call frame, logs and error
 pub async fn get_call_frame(
-    tx: Transaction,
+    tx: &Transaction,
     provider: Arc<RootProvider<PubSubFrontend>>,
 ) -> eyre::Result<CallFrame> {
     // Configure tracing options - disable memory, return data, storage and stack for performance
@@ -34,6 +36,13 @@ pub async fn get_call_frame(
         ..Default::default()
     };
 
+    let call_config = CallConfig {
+        with_log: Some(true),
+        only_top_call: Some(false),
+    };
+
+    let tracer_config = GethDebugTracerConfig(serde_json::to_value(call_config).unwrap());
+
     // Set up debug tracing with call tracer and timeout
     let tracing_options = GethDebugTracingOptions {
         tracer: Some(GethDebugTracerType::BuiltInTracer(
@@ -41,13 +50,13 @@ pub async fn get_call_frame(
         )),
         timeout: Some("10s".to_string()),
         config: trace_options,
-        tracer_config: GethDebugTracerConfig::default(),
+        tracer_config,
     };
 
     // Execute debug trace call using latest block since transaction is pending
     let geth_trace = match provider
         .debug_trace_call(
-            tx.into(),
+            tx.clone().into(),
             BlockId::Number(BlockNumberOrTag::Latest),
             GethDebugTracingCallOptions {
                 tracing_options,

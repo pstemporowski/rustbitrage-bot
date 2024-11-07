@@ -107,6 +107,12 @@ pub fn decode_swap_function(tx: &Transaction) -> Result<Option<SwapInfo>> {
     }
 }
 
+// #[derive(Debug, Clone)]
+// pub struct PoolSwapInfo {
+//     pub amount0_out: U256,
+//     pub amount1_out: U256,
+//     pub to: Address,
+// }
 /// Recursively checks the call frame and its subcalls to find any interactions with known AMM pools.
 ///
 /// This function takes a `CallFrame` object, a map of pool addresses to AMM instances, and a mutable

@@ -346,7 +346,6 @@ impl Graph {
             return Err(eyre!("Cycle must start and end with the same token"));
         }
 
-        let start = Instant::now();
         let mut optimal_amount = U256::ZERO;
         let mut best_profit = U256::ZERO;
 
