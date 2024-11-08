@@ -11,8 +11,9 @@ use alloy::{
 use amms::amm::AMM;
 use dashmap::DashMap;
 use eyre::Result;
-use log::warn;
+use log::{info, warn};
 use std::sync::Arc;
+use tokio::time::Instant;
 
 use crate::types::swap_event::Swap;
 
@@ -32,6 +33,7 @@ pub async fn extract_swaps(
     tx: &Transaction,
     pools_map: &DashMap<Address, AMM>,
 ) -> Result<Vec<SwapInfo>> {
+    let now = Instant::now();
     let mut swaps = Vec::new();
     let mut logs = Vec::new();
 
@@ -44,6 +46,7 @@ pub async fn extract_swaps(
         }
     }
 
+    info!("Extracted {} swaps in {:?}", swaps.len(), now.elapsed());
     Ok(swaps)
 }
 pub fn extract_logs(frame: CallFrame, logs: &mut Vec<CallLogFrame>) {
@@ -55,8 +58,6 @@ pub fn extract_logs(frame: CallFrame, logs: &mut Vec<CallLogFrame>) {
         extract_logs(call, logs);
     }
 }
-
-pub static V2_SWAP_EVENT_ID: &str = "0xd78ad95f";
 
 pub fn process_log(
     log: CallLogFrame,
@@ -72,8 +73,6 @@ pub fn process_log(
         if !Swap::SIGNATURE_HASH.eq(&topics[0]) {
             // This is not a Swap event
             return Ok(None);
-        } else {
-            warn!("Found Swap event");
         }
 
         // Fetch the pool from the map

@@ -90,7 +90,7 @@ pub async fn process_transaction(
         };
 
         opportunities.iter().for_each(|op| {
-            info!(
+            warn!(
                 "\n🔥 ARBITRAGE OPPORTUNITY FOUND! 🔥\n\
                 \n📍 Path: {:?}\
                 \n💰 Expected Profit: {} WEI\

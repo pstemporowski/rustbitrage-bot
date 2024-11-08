@@ -11,7 +11,6 @@ use dashmap::{DashMap, DashSet};
 use eyre::eyre;
 use eyre::Result;
 use log::info;
-use log::warn;
 use rayon::prelude::*;
 use std::{str::FromStr, sync::Arc, time::Instant};
 /// Represents a graph with nodes and edges.
@@ -109,7 +108,6 @@ impl Graph {
     /// A `Result` containing a vector of vectors of `Address`, where each inner vector represents a
     /// negative cycle that starts and ends with the WETH token.
     pub fn find_negative_cycles_from_weth(&self) -> Result<Vec<Vec<Address>>> {
-        let start = Instant::now();
         let weth = Address::from_str(WETH)?;
 
         let node_addresses: Vec<Address> =
@@ -170,7 +168,6 @@ impl Graph {
             }
         });
 
-        info!("find_negative_cycles_from_weth took: {:?}", start.elapsed());
         Ok(negative_cycles.into_iter().collect())
     }
 
@@ -194,8 +191,8 @@ impl Graph {
         swaps: &Vec<SwapInfo>,
         pools_map: &DashMap<Address, AMM>,
     ) -> Result<Vec<ArbitrageOpportunity>> {
-        let start = Instant::now();
         // Clone the graph for simulation
+        let now = Instant::now();
         let mut cloned_graph = self.clone();
 
         swaps.iter().try_for_each(|swap| {
@@ -208,8 +205,8 @@ impl Graph {
         let opportunities = self.find_optimal_trade_amounts(cycles, pools_map)?;
 
         info!(
-            "simulate_swaps_and_check_arbitrage took: {:?}",
-            start.elapsed()
+            "Negative cycle detection took {} ms",
+            now.elapsed().as_millis()
         );
         Ok(opportunities)
     }
@@ -238,7 +235,7 @@ impl Graph {
             let (amount_in, profit) = match self.find_optimal_trade_amount(&cycle, pools_map) {
                 Ok(result) => result,
                 Err(e) => {
-                    warn!("Error finding optimal trade amount: {:?}", e);
+                    info!("Error finding optimal trade amount: {}", e);
                     continue;
                 }
             };
