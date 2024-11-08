@@ -1,4 +1,6 @@
-use crate::{modules::processor::pending_tx_processor::Swap, utils::constants::WETH};
+use crate::types::arbitrage_opportunity::ArbitrageOpportunity;
+use crate::utils::constants::WETH;
+use crate::utils::swap::SwapInfo;
 
 use super::{Edge, Node};
 use alloy::primitives::Address;
@@ -8,7 +10,8 @@ use amms::amm::{AutomatedMarketMaker, AMM};
 use dashmap::{DashMap, DashSet};
 use eyre::eyre;
 use eyre::Result;
-use log::{error, info};
+use log::info;
+use log::warn;
 use rayon::prelude::*;
 use std::{str::FromStr, sync::Arc, time::Instant};
 /// Represents a graph with nodes and edges.
@@ -16,13 +19,6 @@ use std::{str::FromStr, sync::Arc, time::Instant};
 pub struct Graph {
     pub nodes: DashMap<Address, Node>,
     pub edges: DashMap<(Address, Address), Edge>,
-}
-
-/// Represents an arbitrage opportunity with the optimal amount and expected profit.
-pub struct ArbitrageOpportunity {
-    pub path: Vec<Address>,
-    pub optimal_amount_in: U256,
-    pub expected_profit: U256,
 }
 
 impl Graph {
@@ -193,70 +189,97 @@ impl Graph {
     /// # Returns
     /// A vector of `ArbitrageOpportunity` structs, each representing a negative cycle that could be
     /// exploited for arbitrage.
-    pub fn simulate_swaps_and_check_arbitrage(
+    pub fn find_opportunities(
         &self,
-        swaps: &Swap,
+        swaps: &Vec<SwapInfo>,
         pools_map: &DashMap<Address, AMM>,
     ) -> Result<Vec<ArbitrageOpportunity>> {
         let start = Instant::now();
         // Clone the graph for simulation
-        let cloned_graph = self.clone();
+        let mut cloned_graph = self.clone();
 
-        let pools = &swaps.pools;
-        let path = &swaps.path;
-        let mut amount_in = swaps.amount_in;
+        swaps.iter().try_for_each(|swap| {
+            // Simulate the swap effect on the AMM pools
+            cloned_graph.simulate_swap_mut(swap, pools_map)
+        })?;
 
-        for (i, pool) in pools.iter().enumerate() {
-            let mut pool = pool.clone();
-            let token0 = path[i];
-
-            let token1 = match path.get(i + 1) {
-                Some(token) => *token,
-                None => {
-                    error!(
-                        "Invalid path with {:?} pools, pairs {:?} at index {}",
-                        pools, path, i
-                    );
-                    break;
-                }
-            };
-            // Simulate the swap's effect on the pool's reserves
-            amount_in = pool.simulate_swap_mut(token0, token1, amount_in)?;
-
-            // Update the edge weights in the cloned graph based on the new reserves
-            if let Ok(rate) = pool.calculate_price(token0, token1) {
-                let weight = -rate.ln();
-                cloned_graph.upsert_edge(&token0, &token1, weight, pool.address());
-            }
-        }
         // Run negative cycle detection on the updated graph
         let cycles = cloned_graph.find_negative_cycles_from_weth()?;
-
-        let mut opportunities = Vec::new();
-
-        // For each negative cycle detected, calculate the optimal amount and expected profit
-        for cycle in cycles {
-            let (amount_in, profit) =
-                match cloned_graph.find_optimal_trade_amount(&cycle, pools_map) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        error!("Error finding optimal trade amount: {:?}", e);
-                        continue;
-                    }
-                };
-
-            opportunities.push(ArbitrageOpportunity {
-                path: cycle,
-                optimal_amount_in: amount_in,
-                expected_profit: profit,
-            });
-        }
+        let opportunities = self.find_optimal_trade_amounts(cycles, pools_map)?;
 
         info!(
             "simulate_swaps_and_check_arbitrage took: {:?}",
             start.elapsed()
         );
         Ok(opportunities)
+    }
+
+    /// Finds the optimal trade amounts and expected profits for each negative cycle detected in the graph.
+    ///
+    /// This function takes a vector of negative cycles, where each cycle is represented as a vector of addresses.
+    /// For each negative cycle, it calculates the optimal trade amount and expected profit, and returns a vector of
+    /// `ArbitrageOpportunity` structs containing the cycle, optimal amount, and expected profit.
+    ///
+    /// # Arguments
+    /// * `cycles` - A vector of negative cycles, where each cycle is represented as a vector of addresses.
+    /// * `pools_map` - A map of AMM pools, keyed by the pool address.
+    ///
+    /// # Returns
+    /// A vector of `ArbitrageOpportunity` structs, each representing a negative cycle that could be exploited for arbitrage.
+    pub fn find_optimal_trade_amounts(
+        &self,
+        cycles: Vec<Vec<Address>>,
+        pools_map: &DashMap<Address, AMM>,
+    ) -> Result<Vec<ArbitrageOpportunity>> {
+        let mut opportunities = Vec::new();
+
+        // For each negative cycle detected, calculate the optimal amount and expected profit
+        for cycle in cycles {
+            let (amount_in, profit) = match self.find_optimal_trade_amount(&cycle, pools_map) {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!("Error finding optimal trade amount: {:?}", e);
+                    continue;
+                }
+            };
+
+            opportunities.push(ArbitrageOpportunity {
+                path: cycle.clone(),
+                optimal_amount_in: amount_in,
+                expected_profit: profit,
+            });
+        }
+
+        Ok(opportunities)
+    }
+
+    /// Simulates a swap on the given AMM pool and updates the graph with the new edge weight.
+    ///
+    /// This function takes a `SwapInfo` struct that contains the details of the swap, and a map of AMM pools.
+    /// It first retrieves the pool from the pools map, and then simulates the swap on the pool. After the swap,
+    /// it calculates the new exchange rate between the two tokens and updates the edge weight in the graph.
+    ///
+    /// # Arguments
+    /// * `swap` - A `SwapInfo` struct containing the details of the swap to be simulated.
+    /// * `pools_map` - A `DashMap` containing the AMM pools, keyed by the pool address.
+    ///
+    /// # Returns
+    /// * `Ok(())` if the swap simulation and graph update were successful.
+    /// * `Err(...)` if there was an error during the swap simulation or graph update.
+    pub fn simulate_swap_mut(
+        &mut self,
+        swap: &SwapInfo,
+        pools_map: &DashMap<Address, AMM>,
+    ) -> Result<()> {
+        if let Some(mut pool) = pools_map.get_mut(&swap.pool_address) {
+            pool.simulate_swap_mut(swap.from_token, swap.to_token, swap.amount_in)?;
+
+            if let Ok(rate) = pool.calculate_price(swap.from_token, swap.to_token) {
+                let weight = -rate.ln();
+                self.upsert_edge(&swap.from_token, &swap.to_token, weight, pool.address());
+            }
+        }
+        Ok(())
     }
 
     /// Builds a negative cycle from the given start address and predecessor map.
@@ -339,7 +362,7 @@ impl Graph {
     /// * An error if no profitable arbitrage was found.
     pub fn find_optimal_trade_amount(
         &self,
-        cycle: &[Address],
+        cycle: &Vec<Address>,
         pools_map: &DashMap<Address, AMM>,
     ) -> Result<(U256, U256)> {
         if cycle.first() != cycle.last() {
@@ -352,7 +375,8 @@ impl Graph {
         // More realistic initial bounds based on typical DEX liquidity
         let mut left = U256::from(1) * U256::from(10).pow(U256::from(15)); // 0.001 ETH in wei
         let mut right = U256::from(1) * U256::from(10).pow(U256::from(21)); // 1000 ETH in wei
-                                                                            // Perform binary search to find the optimal trade amount
+
+        // Perform binary search to find the optimal trade amount
         while left < right {
             let mid = left + (right - left) / U256::from(2);
 
@@ -401,7 +425,7 @@ impl Graph {
     /// no profitable arbitrage was found or an error occurred during the calculation.
     fn calculate_profit(
         &self,
-        cycle: &[Address],
+        cycle: &Vec<Address>,
         amount_in: U256,
         pools_map: &DashMap<Address, AMM>,
     ) -> Result<U256> {

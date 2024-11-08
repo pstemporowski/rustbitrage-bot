@@ -2,13 +2,16 @@ use alloy::{
     primitives::{Address, U256},
     providers::RootProvider,
     pubsub::PubSubFrontend,
-    rpc::types::{trace::geth::CallLogFrame, Transaction},
+    rpc::types::{
+        trace::geth::{CallFrame, CallLogFrame},
+        Transaction,
+    },
     sol_types::SolEvent,
 };
 use amms::amm::AMM;
 use dashmap::DashMap;
 use eyre::Result;
-use log::{info, warn};
+use log::warn;
 use std::sync::Arc;
 
 use crate::types::swap_event::Swap;
@@ -30,10 +33,12 @@ pub async fn extract_swaps(
     pools_map: &DashMap<Address, AMM>,
 ) -> Result<Vec<SwapInfo>> {
     let mut swaps = Vec::new();
+    let mut logs = Vec::new();
 
     let frame = get_call_frame(&tx, provider).await?;
+    extract_logs(frame, &mut logs);
 
-    for log in frame.logs {
+    for log in logs {
         if let Some(swap_info) = process_log(log, pools_map)? {
             swaps.push(swap_info);
         }
@@ -41,6 +46,17 @@ pub async fn extract_swaps(
 
     Ok(swaps)
 }
+pub fn extract_logs(frame: CallFrame, logs: &mut Vec<CallLogFrame>) {
+    let frame_logs = frame.logs;
+
+    logs.extend(frame_logs.into_iter());
+
+    for call in frame.calls {
+        extract_logs(call, logs);
+    }
+}
+
+pub static V2_SWAP_EVENT_ID: &str = "0xd78ad95f";
 
 pub fn process_log(
     log: CallLogFrame,
@@ -55,10 +71,9 @@ pub fn process_log(
 
         if !Swap::SIGNATURE_HASH.eq(&topics[0]) {
             // This is not a Swap event
-            warn!("Topic does not match Swap event signature");
             return Ok(None);
         } else {
-            warn!("Swap event detected");
+            warn!("Found Swap event");
         }
 
         // Fetch the pool from the map
@@ -73,14 +88,9 @@ pub fn process_log(
         if let AMM::UniswapV2Pool(pool) = pool {
             // Decode the Swap event data
             let decoded_swap = Swap::abi_decode_data(&data, true)?;
-            let (amount0_in, amount1_in, amount0_out, amount1_out) = decoded_swap;
+            let (amount0_in, amount1_in, _, _) = decoded_swap;
             let token_0 = pool.token_a;
             let token_1 = pool.token_b;
-
-            info!("Amount0 in: {}", amount0_in);
-            info!("Amount1 in: {}", amount1_in);
-            info!("Amount0 out: {}", amount0_out);
-            info!("Amount1 out: {}", amount1_out);
 
             if amount0_in > U256::ZERO {
                 let swap_info = SwapInfo {
