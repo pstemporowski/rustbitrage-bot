@@ -62,7 +62,7 @@ impl Graph {
     /// Returns all the edges in the graph.
     pub fn get_edges(&self) -> Vec<Edge> {
         self.edges
-            .iter()
+            .par_iter()
             .map(|entry| entry.value().clone())
             .collect()
     }
@@ -92,6 +92,7 @@ impl Graph {
                 self.upsert_edge(&token1, &token0, weight, pool.address());
             }
         });
+        
         info!("update_by_pools took: {:?}", start.elapsed());
     }
 
@@ -322,18 +323,7 @@ impl Graph {
                 None => break,
             }
         }
-
         None
-    }
-    /// Converts exchange rates to log-space weights for arbitrage detection.
-    pub fn convert_rates_to_weights(&self) {
-        let start = Instant::now();
-        for mut edge_entry in self.edges.iter_mut() {
-            let edge = edge_entry.value_mut();
-            // Convert the exchange rate to negative log for arbitrage detection
-            edge.weight = -edge.weight.ln();
-        }
-        info!("convert_rates_to_weights took: {:?}", start.elapsed());
     }
 
     /// Finds the optimal trade amount and the corresponding profit for a given arbitrage cycle.
